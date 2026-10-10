@@ -5,9 +5,14 @@
 #define MASTER_HOST "seismoM5"
 #define SLAVE_HOST "seismoS1"
 
+// WiFi, MQTT, ntfy and logging settings live in secrets.h (not committed)
+#if __has_include("secrets.h")
+  #include "secrets.h"
+#else
+  #include "secrets.example.h"
+#endif
+
 //WiFi Parameters
-#define WIFI_SSID "XXXXXXX"
-#define WIFI_PASS "XXXXXXX"
 #ifdef SLAVE
   #define WIFI_HOSTNAME SLAVE_HOST
 #else
@@ -18,10 +23,7 @@
 // MQTT Parameters
 bool MQTT_active = true; // Enable / Disable MQTT for initial start only
 
-#define MQTT_SERVER "XXXXXXX"
 #define MQTT_PORT 1883
-#define MQTT_USER "XXXXXXX"
-#define MQTT_PASS "XXXXXXX"
 
 #ifdef SLAVE
   #define MQTT_PUB_TOPIC_MAIN MASTER_HOST "/" SLAVE_HOST
@@ -36,6 +38,38 @@ bool MQTT_active = true; // Enable / Disable MQTT for initial start only
 #define MQTT_PUB_AVAILABILITY (MQTT_PUB_TOPIC_MAIN "/status") // online or offline
 #define MQTT_PUB_PGA_TRIGGER (MQTT_PUB_TOPIC_MAIN "/pga_trigger") // change pga_trigger
 #define MQTT_PUB_COMMAND (MQTT_PUB_TOPIC_MAIN "/command")
+
+// Push notifications (ntfy.sh) and ESP-NOW alerts to a notifier stick
+#define NTFY_ENABLE true
+#define ESPNOW_ENABLE true
+#define ESPNOW_HEARTBEAT_MS 10000
+
+// Copy every sample and log line to a computer over WiFi (UDP), so the sensor
+// can be logged without a USB cable. Receiver: tools/udplog.py
+#define UDP_LOG_ENABLE true
+#define UDP_LOG_PORT 5514
+
+// Auto-recalibrate when an "earthquake" reading stays flat this long (sensor was moved)
+#define TILT_STUCK_MS 60000
+#define TILT_STEADY_BAND 0.004 // g; real shaking varies more than this
+
+// PGA is measured against a slow moving average of the accelerometer, so
+// temperature drift and small tilts fade out instead of raising the baseline
+#define DYN_TAU_SAMPLES 300   // 10 Hz -> ~30 s
+
+// Two alarm levels, both need shaking that lasts (a bump is a short spike):
+// blue = weak but sustained (distant aftershock, or someone at the desk)
+#define SUSTAIN_ENABLE true
+#define SUSTAIN_LEVEL 0.006   // g
+#define SUSTAIN_COUNT 12      // samples above SUSTAIN_LEVEL...
+#define SUSTAIN_WINDOW 50     // ...within this many samples (10 Hz -> 5 s)
+// red = strong and sustained: STRONG_COUNT samples above pga_trigger (web setting)
+// within SUSTAIN_WINDOW. A bump on the desk peaks over it for a moment only.
+#define STRONG_COUNT 10
+
+// Detections page at /events: last EVENTS_KEEP events, kept across reboots
+#define EVENTS_KEEP 20
+#define LOCAL_TZ "EST5"   // POSIX TZ; EST5 = UTC-5 all year (Panama)
 
 // SPK HAT, default disabled
 #define SPK_pin 26
@@ -227,6 +261,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       </fieldset>
       <br />
       <div class="button-container-div">
+        <button onclick="window.location.href='/events';"> Detecciones</button>
         <button onclick="window.location.href='/webserial';"> Web Serial</button>
       </div>
       <br />

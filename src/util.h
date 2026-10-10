@@ -38,8 +38,13 @@ extern bool webSerialEnabled; // Disable until WebSerial is loaded
 
 extern Preferences preferences; // To store and read parameters
 
+// Copy of log lines and samples to a computer over WiFi (util.cpp)
+void udplog_write(const String& text, bool newline);
+void udplog_loop();
+
 template<typename T>
 void logln(T msg) {
+  udplog_write(String(msg), true);
   if (logging == 1 || logging == 3) Serial.println(msg);
   if ((logging == 2 || logging == 3) && webSerialEnabled) WebSerial.println(msg);
 }
@@ -54,6 +59,7 @@ void logln(T msg, U digits) {
 
 template<typename T>
 void log(T msg) {
+  udplog_write(String(msg), false);
   if (logging == 1 || logging == 3) Serial.print(msg);
   if ((logging == 2 || logging == 3) && webSerialEnabled) WebSerial.print(msg);
 }

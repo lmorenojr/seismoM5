@@ -16,6 +16,58 @@
 #include "mqtt.h"
 #include "stalta.h"
 #include "screen.h"
+#include "notify.h"
+#include "udplog.h"
+#include "events.h"
+
+float tilt_ref_pga = 0;
+unsigned long tilt_steady_since = 0;
+
+uint8_t eq_level = SEISMO_LEVEL_NONE;  // highest level reached by the current event
+unsigned long eq_started_ms = 0;
+float pga_raw = 0;  // against the calibration only, before drift removal
+
+// Slow moving average of the acceleration; pga is measured against it
+float ref_x = 0, ref_y = 0, ref_z = 0;
+bool ref_ready = false;
+
+float dynamic_pga(float x, float y, float z) {
+  if (!ref_ready) {
+    ref_x = x; ref_y = y; ref_z = z;
+    ref_ready = true;
+  }
+  float dx = x - ref_x, dy = y - ref_y, dz = z - ref_z;
+  const float a = 1.0f / DYN_TAU_SAMPLES;
+  ref_x += a * dx; ref_y += a * dy; ref_z += a * dz;
+  return sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+// Ring buffer for the sustained-shaking levels: bit 0 = above SUSTAIN_LEVEL,
+// bit 1 = above pga_trigger
+uint8_t shake_flags[SUSTAIN_WINDOW] = {0};
+int shake_idx = 0;
+int weak_count = 0;
+int strong_count = 0;
+
+uint8_t shaking_level(float pga) {
+  uint8_t f = (pga >= SUSTAIN_LEVEL ? 1 : 0) | (pga >= pga_trigger ? 2 : 0);
+  uint8_t old = shake_flags[shake_idx];
+  weak_count += (f & 1) - (old & 1);
+  strong_count += ((f >> 1) & 1) - ((old >> 1) & 1);
+  shake_flags[shake_idx] = f;
+  shake_idx = (shake_idx + 1) % SUSTAIN_WINDOW;
+  if (strong_count >= STRONG_COUNT) return SEISMO_LEVEL_STRONG;
+  if (SUSTAIN_ENABLE && weak_count >= SUSTAIN_COUNT) return SEISMO_LEVEL_WEAK;
+  return SEISMO_LEVEL_NONE;
+}
+
+void sustained_reset() {
+  memset(shake_flags, 0, sizeof(shake_flags));
+  shake_idx = 0;
+  weak_count = 0;
+  strong_count = 0;
+  ref_ready = false;
+}
 
 AsyncWebServer server(80);
 
@@ -53,6 +105,7 @@ void calibrate_MPU() {
 
   seismo.calibrateAccel(buffersize,acel_deadzone);
 
+  sustained_reset(); // old samples are from before the new offsets
   calibrating = false;
   delay(100);
   seismo.getAccelAdc(&ax, &ay, &az);
@@ -88,7 +141,19 @@ String config_processor(const String& var){
   return server_details;
 }
 
-void eq_happening() {
+void eq_happening(uint8_t level = SEISMO_LEVEL_STRONG) {
+  if (!eq_status || level > eq_level) {
+    bool escalated = eq_status;
+    if (!eq_status) {
+      eq_started_ms = millis();
+      events_start();
+    }
+    eq_level = level;
+    logln(String(escalated ? "[trigger] escalated" : "[trigger]") + (level >= SEISMO_LEVEL_STRONG ? " strong (red)" : " weak (blue)") +
+          " pga=" + String(pga, 4));
+    notify_eq_start(pga, pga_trigger, level, escalated);
+  }
+  else notify_eq_update(pga);
   eq_status = true;
   eq_time_count = 0;
   lcd.set_brightness(15); // Full Brightness
@@ -183,6 +248,8 @@ void setup() {
     }
   }
   
+  espnow_init();
+  events_begin();
   if (MQTT_active) connectToMqtt();
 
   WebSerial.begin(&server);
@@ -221,6 +288,13 @@ void setup() {
   pga_trigger_changed = pga_trigger;
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {request->send_P(200, "text/html", index_html,config_processor);});
+  server.on("/events", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html", events_page(pga, pga_trigger, eq_status));
+  });
+  server.on("/event_del", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("t")) events_delete(strtoul(request->getParam("t")->value().c_str(), nullptr, 10));
+    request->redirect("/events");
+  });
   server.on("/rt", HTTP_GET, [](AsyncWebServerRequest *request){handleReset(request);});
   server.on("/recal", HTTP_GET, [](AsyncWebServerRequest *request){
     calibrating = true;
@@ -264,6 +338,8 @@ void setup() {
 
 void loop() {
   checkConnection();
+  notify_loop(pga, pga_trigger);
+  udplog_loop();
   ArduinoOTA.handle();
   if (!calibrating) {
     M5.update();
@@ -289,7 +365,8 @@ void loop() {
     y_vector_mag = ay / gravity;
     z_vector_mag = az / gravity;
 
-    pga = sqrt(x_vector_mag * x_vector_mag + y_vector_mag * y_vector_mag + z_vector_mag * z_vector_mag)*scale_factor;
+    pga_raw = sqrt(x_vector_mag * x_vector_mag + y_vector_mag * y_vector_mag + z_vector_mag * z_vector_mag)*scale_factor;
+    pga = dynamic_pga(x_vector_mag, y_vector_mag, z_vector_mag)*scale_factor;
 
 // For Helicorder:
 // Serial Studio
@@ -297,6 +374,12 @@ void loop() {
 // Jamasesis - Select ASCII 4
 //    String msg = String(ax) + " , " + String(ay) +" , " + String(az) + " , " + String(int(pga*10000)).c_str() ;
 //    Serial.println(msg);
+    char pga_line[64];
+    snprintf(pga_line, sizeof(pga_line), "PGA,%lu,%d,%d,%d,%.5f,%.5f", millis(), ax, ay, az, pga, pga_raw);
+#ifdef PGA_STREAM
+    Serial.println(pga_line);
+#endif
+    udplog_write(pga_line, true);
 
     if ((continuous_graph) || (not continuous_graph && eq_status)){
       if (slta) {
@@ -317,11 +400,32 @@ void loop() {
       }
     } else {
       lcd.show_pga(pga);
-      if (pga >= pga_trigger) {
+      uint8_t level = shaking_level(pga);
+      if (level != SEISMO_LEVEL_NONE) {
         if ((master && slave_eq_state) || !master) {
-          eq_happening();
+          eq_happening(level);
         }
       }
+    }
+
+    // A real quake keeps changing; a reading stuck above the trigger without
+    // moving means the stick was tilted or shifted. Recalibrate instead of
+    // alarming forever.
+    if (!eq_status || fabs(pga - tilt_ref_pga) > TILT_STEADY_BAND) {
+      tilt_ref_pga = pga;
+      tilt_steady_since = millis();
+    } else if (millis() - tilt_steady_since > TILT_STUCK_MS) {
+      logln("[tilt] steady " + String(pga, 4) + " g for " + String(TILT_STUCK_MS / 1000) + " s, recalibrating");
+      notify_tilt_recal(pga, pga_trigger);
+      events_end(eq_level, eq_pga_peak, (millis() - eq_started_ms) / 1000.0f, true);
+      eq_status = false;
+      eq_level = SEISMO_LEVEL_NONE;
+      eq_time_count = 0;
+      digitalWrite(M5_LED, HIGH);
+      if (SPK_HAT) ledcWriteTone(spkChannel, 0);
+      lcd.set_brightness(lcd_brightness);
+      tilt_steady_since = millis();
+      calibrating = true;
     }
 
     if (eq_status) { // Earthquake still happening
@@ -332,6 +436,9 @@ void loop() {
           eq_time_count = 0;
 
           updateState("LISTENING");
+          notify_eq_end(pga, pga_trigger, eq_level, (millis() - eq_started_ms) / 1000.0f);
+          events_end(eq_level, eq_pga_peak, (millis() - eq_started_ms) / 1000.0f);
+          eq_level = SEISMO_LEVEL_NONE;
 
           publish_mqtt(MQTT_PUB_EVENT, updateEvent(ax,ay,az,pga).c_str(), 0, true);
 
